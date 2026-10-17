@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "Keep 标记删除线",
+  "version": "0.3.0",
+  "description": "右键添加或删除删除线、高亮，阅读时显示效果并保留原始标记。",
+  "minimum_chrome_version": "105",
+  "permissions": [
+    "storage",
+    "contextMenus"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://keep.google.com/*"
+      ],
+      "js": [
+        "parser.js",
+        "content.js"
+      ],
+      "css": [
+        "content.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Keep 标记删除线",
+    "default_popup": "popup.html"
+  },
+  "options_ui": {
+    "page": "popup.html",
+    "open_in_tab": true
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}

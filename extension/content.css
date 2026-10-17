@@ -1,0 +1,14 @@
+/* Paint-only: no Keep node attributes, styles, text or child nodes are changed. */
+::highlight(keep-mark-strike-original) {
+  color: transparent;
+  text-shadow: none;
+}
+@media print {
+  ::highlight(keep-mark-strike-original) { color: inherit; }
+  #keep-mark-strike-layer { display: none !important; }
+}
+
+::highlight(keep-mark-strike-emphasis) { background-color: #ffe077; color: #202124; }
+@media print {
+  ::highlight(keep-mark-strike-emphasis) { background-color: transparent; color: inherit; }
+}
