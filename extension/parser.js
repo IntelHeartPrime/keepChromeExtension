@@ -7,6 +7,13 @@
     }
   }
 
+  // A divider must occupy a complete logical line; inline hyphens stay literal.
+  function* dividers(text) {
+    for (const match of text.matchAll(/^[\t ]*-{3,}[\t ]*$/gmu)) {
+      yield { index: match.index, raw: match[0], divider: true };
+    }
+  }
+
   function parse(text) {
     const parts = [];
     let cursor = 0;
@@ -43,7 +50,7 @@
         || pairs.some(m => start < m.index + m.raw.length && end > m.index)) return null;
     return { start, end, replacement: marker + selected + marker, inset: 2 };
   }
-  const api = Object.freeze({ parse, matches, editMark });
+  const api = Object.freeze({ parse, matches, dividers, editMark });
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.KeepMarkStrike = api;
 })(globalThis);

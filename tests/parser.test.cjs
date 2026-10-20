@@ -48,3 +48,12 @@ test('explicit mark actions add/remove without nesting or toggling', () => {
   }
   assert.equal(editMark('==重点==', 2, 4, 'strike', 'add'), null);
 });
+
+ test('dividers occupy complete lines and preserve offsets', () => {
+  const { dividers } = require('../extension/parser.js');
+  const input = '上文\r\n  --- \r\n下文\n----\n';
+  const found = [...dividers(input)];
+  assert.deepEqual(found.map(m => m.raw), ['  --- ', '----']);
+  for (const match of found) assert.equal(input.slice(match.index, match.index + match.raw.length), match.raw);
+  for (const text of ['a---b', '--', '---正文', '正文---', '==---==']) assert.equal([...dividers(text)].length, 0);
+});

@@ -19,16 +19,27 @@
   document.documentElement.append(host);
   const records = new Map();
   let enabled = false;
-  let composing = false;
-  let pressing = false;
+  let composing = null;
+  let pressing = null;
   let frame = 0;
   let destroyed = false;
   const events = new AbortController();
 
-  function clear() {
-    CSS.highlights.delete(KEY);
-    CSS.highlights.delete(EMPHASIS);
-    for (const record of records.values()) {
+  function clear(element) {
+    if (!element) {
+      CSS.highlights.delete(KEY);
+      CSS.highlights.delete(EMPHASIS);
+    }
+    for (const [body, record] of records) {
+      if (element && body !== element) continue;
+      if (element) {
+        for (const key of [KEY, EMPHASIS]) {
+          const highlight = CSS.highlights.get(key);
+          if (highlight) for (const range of [...highlight]) {
+            if (body.contains(range.startContainer)) highlight.delete(range);
+          }
+        }
+      }
       record.mirror?.remove();
       record.mirror = null;
     }
@@ -117,7 +128,7 @@
     const selection = getSelection();
     const caret = selection?.rangeCount && element.contains(document.activeElement)
       && element.contains(selection.focusNode) ? selection.getRangeAt(0) : null;
-    for (const match of KeepMarkStrike.matches(text)) {
+    for (const match of [...KeepMarkStrike.matches(text), ...KeepMarkStrike.dividers(text)]) {
       const start = match.index, end = start + match.raw.length;
       // The entire logical line(s) containing the pair stay raw while editing.
       const lineStart = text.lastIndexOf('\n', start - 1) + 1;
@@ -130,6 +141,25 @@
         line.setStart(first.node, Math.max(0, lineStart - first.start));
         line.setEnd(last.node, Math.min(last.node.length, lineEnd - last.start));
         if (line.comparePoint(caret.startContainer, caret.startOffset) === 0) continue;
+      }
+      if (match.divider) {
+        const ruleRanges = ranges(start, end);
+        const rect = ruleRanges[0]?.getBoundingClientRect();
+        if (!rect) continue;
+        const style = getComputedStyle(element);
+        const box = element.getBoundingClientRect();
+        const left = Math.max(bounds.left, box.left + parseFloat(style.paddingLeft));
+        const right = Math.min(bounds.right, box.right - parseFloat(style.paddingRight));
+        const y = rect.top + rect.height / 2;
+        if (right <= left || y < bounds.top || y >= bounds.bottom) continue;
+        for (const range of ruleRanges) highlights.add(range);
+        const line = document.createElement('div');
+        line.className = 'divider';
+        line.style.cssText = `position:fixed;left:${left}px;top:${y}px;width:${right - left}px;height:1px;pointer-events:none`;
+        line.style.backgroundColor = style.color;
+        line.style.opacity = '0.35';
+        mirror.append(line);
+        continue;
       }
       for (const range of [...ranges(start, start + 2), ...ranges(end - 2, end)]) highlights.add(range);
       for (const range of ranges(start + 2, end - 2)) {
@@ -174,6 +204,8 @@
 
   function render() {
     frame = 0;
+    // Clear and rebuild synchronously in one animation frame, so the browser
+    // never paints an empty layer between unrelated page updates.
     clear();
     for (const [element] of records) {
       if (!element.isConnected) {
@@ -182,18 +214,23 @@
         records.delete(element);
       }
     }
-    if (!enabled || composing || pressing || document.hidden || !getSelection()?.isCollapsed) return;
+    if (!enabled || document.hidden) return;
+    const selection = getSelection();
     const dialog = [...document.querySelectorAll('[role="dialog"]')].find(el => el.getClientRects().length);
     const highlights = new Highlight();
     const emphasis = new Highlight();
     for (const [element, record] of records) {
-      if (!record.visible || !/(~~|==)/.test(element.textContent)) continue;
+      if (element === composing || element === pressing) continue;
+      if (selection && !selection.isCollapsed && Array.from({ length: selection.rangeCount },
+        (_, index) => selection.getRangeAt(index)).some(range => range.intersectsNode(element))) continue;
+      if (!record.visible || !/(~~|==|---)/.test(element.textContent)) continue;
       const style = safe(element, dialog);
       if (!style) continue;
       const editing = element.contains(document.activeElement) || (element.isContentEditable && dialog?.contains(element));
       const text = element.innerText;
       const parts = KeepMarkStrike.parse(text);
-      if (!editing && !parts.some(part => part.strike || part.highlight)) continue;
+      const hasDivider = [...KeepMarkStrike.dividers(text)].length > 0;
+      if (!editing && !hasDivider && !parts.some(part => part.strike || part.highlight)) continue;
       // A pair may not span multiple text nodes, even if their styles match.
       const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
       let localPairs = 0;
@@ -213,7 +250,7 @@
       const hit = document.elementFromPoint((left + right) / 2, (top + bottom) / 2);
       if (!hit || !(element === hit || element.contains(hit))) continue;
       const mirror = document.createElement('div');
-      if (editing) {
+      if (editing || hasDivider) {
         decorateEditor(element, mirror, highlights, emphasis, { left, top, right, bottom });
         shadow.append(mirror);
         record.mirror = mirror;
@@ -240,7 +277,7 @@
 
   const observer = new MutationObserver(changes => {
     // Shadow-root updates are not observed. Only discover in newly added subtrees.
-    clear();
+    // Keep the existing paint until render; hover often mutates unrelated UI.
     for (const change of changes) {
       for (const node of change.addedNodes) discover(node);
       if (change.type === 'attributes' && change.target.matches?.(BODY)) discover(change.target);
@@ -251,9 +288,16 @@
   function listen(type, handler, options = {}) {
     document.addEventListener(type, handler, { capture: true, signal: events.signal, ...options });
   }
-  listen('pointerdown', () => { pressing = true; clear(); });
-  listen('pointerup', () => { pressing = false; schedule(); });
-  listen('pointercancel', () => { pressing = false; schedule(); });
+  function eventBody(event) {
+    return event.target instanceof Element ? event.target.closest(BODY) : null;
+  }
+  function clearEventBody(event) {
+    const body = eventBody(event);
+    if (body) clear(body);
+  }
+  listen('pointerdown', event => { pressing = eventBody(event); clearEventBody(event); schedule(); });
+  listen('pointerup', () => { pressing = null; schedule(); });
+  listen('pointercancel', () => { pressing = null; schedule(); });
   let menuSelection = null;
   function captureMenuSelection(event) {
     menuSelection = null;
@@ -310,25 +354,26 @@
     }
     schedule();
   }
-  listen('contextmenu', event => { pressing = false; captureMenuSelection(event); schedule(); });
+  listen('contextmenu', event => { pressing = null; captureMenuSelection(event); schedule(); });
   const onMenuMessage = message => {
     if (message?.type === 'keep-edit-mark') editMenuSelection(message);
   };
   chrome.runtime.onMessage.addListener(onMenuMessage);
-  listen('keydown', () => { menuSelection = null; clear(); schedule(); });
-  listen('focusin', () => { clear(); schedule(); });
+  listen('keydown', event => { menuSelection = null; clearEventBody(event); schedule(); });
+  listen('focusin', schedule);
   listen('focusout', schedule);
-  listen('compositionstart', () => { composing = true; clear(); });
-  listen('compositionend', () => { composing = false; schedule(); });
-  listen('beforeinput', clear);
+  listen('compositionstart', event => { composing = eventBody(event); clearEventBody(event); schedule(); });
+  listen('compositionend', () => { composing = null; schedule(); });
+  listen('beforeinput', clearEventBody);
   listen('input', schedule);
-  listen('selectionchange', () => { clear(); schedule(); });
-  listen('scroll', () => { clear(); schedule(); }, { passive: true });
-  listen('visibilitychange', () => { pressing = false; clear(); schedule(); });
-  listen('transitionrun', clear);
+  listen('selectionchange', schedule);
+  listen('scroll', schedule, { passive: true });
+  listen('visibilitychange', () => { pressing = null; clear(); schedule(); });
+  listen('transitionrun', schedule);
   listen('transitionend', schedule);
-  window.addEventListener('resize', () => { clear(); schedule(); }, { signal: events.signal });
-  window.addEventListener('blur', () => { pressing = false; clear(); }, { signal: events.signal });
+  listen('transitioncancel', schedule);
+  window.addEventListener('resize', schedule, { signal: events.signal });
+  window.addEventListener('blur', () => { pressing = null; clear(); }, { signal: events.signal });
   window.addEventListener('focus', schedule, { signal: events.signal });
 
   function destroy() {
