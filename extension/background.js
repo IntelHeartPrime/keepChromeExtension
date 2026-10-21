@@ -16,8 +16,15 @@ chrome.runtime.onInstalled.addListener(() => {
 chrome.contextMenus.onClicked.addListener((info, tab) => {
   const item = actions[info.menuItemId];
   if (!item || !Number.isInteger(tab?.id)) return;
-  chrome.tabs.sendMessage(tab.id, { type: 'keep-edit-mark', kind: item.kind, action: item.action },
-    { frameId: info.frameId ?? 0 }).catch(() => {
-    // A closed/reloaded tab or a tab awaiting extension reload has no receiver.
+  chrome.tabs.sendMessage(tab.id, { type: 'keep-edit-mark', kind: item.kind, action: item.action,
+    selectionText: info.selectionText },
+    { frameId: info.frameId ?? 0 }).then(result => {
+    chrome.action.setBadgeText({ tabId: tab.id, text: result?.ok ? '' : '!' }).catch(() => {});
+    chrome.action.setTitle({ tabId: tab.id, title: result?.ok ? 'Keep 标记删除线'
+      : result?.reason || '未收到编辑结果，请刷新 Keep 页面后重试。' }).catch(() => {});
+  }).catch(() => {
+    chrome.action.setBadgeText({ tabId: tab.id, text: '!' }).catch(() => {});
+    chrome.action.setTitle({ tabId: tab.id,
+      title: '扩展尚未连接当前页面，请刷新 Keep 页面后重试。' }).catch(() => {});
   });
 });

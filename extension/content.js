@@ -299,74 +299,191 @@
   listen('pointerup', () => { pressing = null; schedule(); });
   listen('pointercancel', () => { pressing = null; schedule(); });
   let menuSelection = null;
-  function captureMenuSelection(event) {
-    menuSelection = null;
-    if (!enabled || composing) return;
+  let recentSelection = null;
+  let menuOpen = false;
+  let noticeTimer;
+  let notice;
+  function menuNotice(text) {
+    if (!notice) {
+      notice = document.createElement('div');
+      notice.setAttribute('role', 'status');
+      notice.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:2147483647;background:#202124;color:white;padding:12px 18px;border-radius:8px;font:14px/1.5 sans-serif;pointer-events:none;max-width:80vw';
+      document.documentElement.append(notice);
+    }
+    notice.textContent = text;
+    clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => { notice?.remove(); notice = null; }, 5000);
+  }
+  let selectionFailure = '';
+  function editableMenuBody(editor) {
+    if (!editor?.isConnected || !editor.isContentEditable) return false;
+    // This is an explicit edit of the user's selection on Keep, not paint
+    // discovery. Keep's generated BODY classes are not an editing contract.
+    if (editor.closest('[role="checkbox"], [aria-hidden="true"], [hidden], .IZ65Hb-r4nke-haAclf, [role="search"], [role="searchbox"]')) return false;
+    const label = `${editor.getAttribute('aria-label') || ''} ${editor.getAttribute('data-placeholder') || ''}`;
+    return !/(^|\s)(title|search)(\s|$)|标题|標題|搜索|搜尋/iu.test(label);
+  }
+  function crossesMenuLine(editor, start, end) {
+    // A wrapper is not a line break. Only boundaries strictly BETWEEN
+    // selected characters count, so selecting a whole DIV/P or its trailing
+    // BR remains a single-line selection.
+    let offset = 0;
+    let crosses = false;
+    const boundary = () => { if (start < offset && offset < end) crosses = true; };
+    function visit(parent) {
+      for (const child of parent.childNodes) {
+        if (child.nodeType === Node.TEXT_NODE) {
+          const from = Math.max(0, start - offset);
+          const to = Math.min(child.length, end - offset);
+          if (to > from && /[\r\n\u2028\u2029]/u.test(child.data.slice(from, to))) crosses = true;
+          offset += child.length;
+        } else if (child instanceof Element) {
+          const block = ['block', 'flow-root', 'list-item', 'flex', 'grid', 'table', 'table-row']
+            .includes(getComputedStyle(child).display);
+          if (block || child.tagName === 'BR') boundary();
+          visit(child);
+          if (block) boundary();
+        }
+      }
+    }
+    visit(editor);
+    return crosses;
+  }
+  function readMenuSelection() {
+    const fail = reason => { selectionFailure = reason; return null; };
+    if (!enabled || composing) return null;
     const selection = getSelection();
-    if (!selection?.rangeCount || selection.isCollapsed) return;
+    if (!selection?.rangeCount || selection.isCollapsed)
+      return fail('右键打开时选区已丢失，请重新选中文字后右键。');
     const range = selection.getRangeAt(0);
     const parent = range.startContainer.nodeType === Node.ELEMENT_NODE ? range.startContainer : range.startContainer.parentElement;
-    const editor = parent.closest(BODY);
-    if (!editor?.isContentEditable || !editor.contains(document.activeElement)
-        || !editor.contains(range.endContainer) || !safe(editor, null)) return;
-    // Keep rich content and selections crossing paragraph boundaries untouched.
-    if (range.cloneContents().querySelector('div,p,br')) return;
+    let editor = parent;
+    while (editor?.isContentEditable && editor.parentElement?.isContentEditable) editor = editor.parentElement;
+    if (!editableMenuBody(editor))
+      return fail('选中文字所在节点不是可编辑正文，或位于标题／搜索框中。');
+    if (!editor.contains(range.endContainer))
+      return fail('选区跨越了不同编辑区，请只选择同一正文中的文字。');
+    const endParent = range.endContainer.nodeType === Node.ELEMENT_NODE
+      ? range.endContainer : range.endContainer.parentElement;
+    // An editable host may itself be nested in contenteditable="false".
+    // Only non-editable nodes INSIDE the host block the operation.
+    if (!parent.isContentEditable || !endParent.isContentEditable)
+      return fail('选区包含不可编辑内容，请只选择正文文字。');
+    const fragment = range.cloneContents();
+    if (fragment.querySelector('a,img,svg,input,textarea,button,[contenteditable="false"]')
+        || parent.closest('a') || endParent.closest('a'))
+      return fail('选区包含链接或其他非纯文本内容，请只选择普通文字。');
     const before = document.createRange();
     before.selectNodeContents(editor);
     before.setEnd(range.startContainer, range.startOffset);
-    const start = before.toString().length;
-    if (!(event.target instanceof Node) || !editor.contains(event.target)) return;
-    menuSelection = { editor, range: range.cloneRange(), text: editor.textContent,
-      html: editor.innerHTML, start, end: start + range.toString().length };
+    const raw = range.toString();
+    // Triple-click/line selections can include a terminal newline. Keep that
+    // separator outside the native replacement rather than deleting it.
+    const leading = raw.match(/^[\r\n\u2028\u2029]*/u)[0].length;
+    const trailing = raw.match(/[\r\n\u2028\u2029]*$/u)[0].length;
+    const start = before.toString().length + leading;
+    const end = before.toString().length + raw.length - trailing;
+    if (start >= end) return fail('选区没有可标记的文字。');
+    if (crossesMenuLine(editor, start, end))
+      return fail('选区实际跨过了换行或段落边界，请选择同一行内的文字。');
+    selectionFailure = '';
+    return { editor, text: editor.textContent, html: editor.innerHTML,
+      selected: selection.toString(), start, end };
   }
   function editMenuSelection(message) {
     const saved = menuSelection;
-    menuSelection = null;
-    if (!enabled || composing || !saved || !saved.editor.isConnected) return;
-    const { editor, range } = saved;
-    if (editor.textContent !== saved.text || editor.innerHTML !== saved.html
-        || !editor.isContentEditable || !safe(editor, null)
-        || !editor.contains(range.startContainer) || !editor.contains(range.endContainer)) return;
+    menuSelection = recentSelection = null;
+    menuOpen = false;
+    if (!enabled) return { ok: false, reason: '扩展已关闭，请先开启。' };
+    if (composing) return { ok: false, reason: '请先结束输入法输入，再执行右键操作。' };
+    if (!saved) return { ok: false, reason: selectionFailure || '右键选区未保存，请重新选择文字后右键。' };
+    const { editor } = saved;
+    if (!editableMenuBody(editor) || editor.textContent !== saved.text || editor.innerHTML !== saved.html)
+      return { ok: false, reason: '正文已变化，请重新选中文字后右键。' };
+    const normalizeSelection = text => text.replace(/\s+/gu, ' ').trim();
+    if (typeof message.selectionText === 'string'
+        && normalizeSelection(message.selectionText) !== normalizeSelection(saved.selected))
+      return { ok: false, reason: '右键选区已变化，请重新选中文字后右键。' };
     const change = KeepMarkStrike.editMark(saved.text, saved.start, saved.end, message.kind, message.action);
-    if (!change) return;
+    if (!change) return { ok: false, reason: message.action === 'remove'
+      ? '请选中完整的已标记文字（可以包含两边的标记）再取消。'
+      : '选区已带标记或包含不支持的内容，请选择未标记的一行文字。' };
     const selection = getSelection();
-    function point(offset) {
+    function point(offset, endPoint = false) {
       const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
       let node;
       while ((node = walker.nextNode())) {
-        if (offset <= node.length) return [node, offset];
+        if (offset < node.length || (endPoint && offset === node.length && node.length)) return [node, offset];
         offset -= node.length;
       }
       return [editor, editor.childNodes.length];
     }
     function select(start, end) {
       const next = document.createRange();
-      next.setStart(...point(start)); next.setEnd(...point(end));
+      next.setStart(...point(start)); next.setEnd(...point(end, true));
       selection.removeAllRanges(); selection.addRange(next);
     }
     clear();
-    editor.focus();
+    editor.focus({ preventScroll: true });
+    // Focus handlers in Keep may replace the editor contents synchronously.
+    if (!editor.isConnected || editor.textContent !== saved.text || editor.innerHTML !== saved.html)
+      return { ok: false, reason: '编辑区在聚焦时发生变化，请重新选择文字。' };
     select(change.start, change.end);
-    // Chromium's native editing command preserves undo and emits a real input
-    // event. Never fall back to direct DOM writes or synthetic save events.
-    if (document.execCommand('insertText', false, change.replacement)) {
-      select(change.start + change.inset, change.start + change.replacement.length - change.inset);
-    }
+    const expected = saved.text.slice(0, change.start) + change.replacement + saved.text.slice(change.end);
+    document.execCommand('insertText', false, change.replacement);
     schedule();
+    if (editor.textContent !== expected)
+      return { ok: false, reason: 'Keep 未完成选区编辑，请重新打开笔记后再试。' };
+    select(change.start + change.inset, change.start + change.replacement.length - change.inset);
+    return { ok: true };
   }
-  listen('contextmenu', event => { pressing = null; captureMenuSelection(event); schedule(); });
-  const onMenuMessage = message => {
-    if (message?.type === 'keep-edit-mark') editMenuSelection(message);
+  // Preserve the selection before a native menu takes focus. Do not allow a
+  // later click or another note's menu to reuse the saved range.
+  listen('pointerdown', event => {
+    menuOpen = false;
+    menuSelection = null;
+    recentSelection = event.button === 2 || (event.button === 0 && event.ctrlKey)
+      ? readMenuSelection() : null;
+  });
+  listen('contextmenu', event => {
+    pressing = null;
+    const selection = getSelection();
+    const current = readMenuSelection();
+    const saved = current || ((!selection?.rangeCount || selection.isCollapsed) ? recentSelection : null);
+    menuSelection = saved && event.target instanceof Node && saved.editor.contains(event.target) ? saved : null;
+    if (saved && !menuSelection) selectionFailure = '右键位置不在已选中的编辑区内，请在选中文字上右键。';
+    menuOpen = true;
+    schedule();
+  });
+  const onMenuMessage = (message, sender, sendResponse) => {
+    if (message?.type !== 'keep-edit-mark') return;
+    let result;
+    try { result = editMenuSelection(message); }
+    catch { result = { ok: false, reason: '无法恢复编辑选区，请重新选择文字后再试。' }; }
+    if (!result.ok) menuNotice(result.reason);
+    sendResponse?.(result);
   };
   chrome.runtime.onMessage.addListener(onMenuMessage);
-  listen('keydown', event => { menuSelection = null; clearEventBody(event); schedule(); });
+  listen('keydown', event => {
+    if (event.key !== 'ContextMenu' && !(event.shiftKey && event.key === 'F10')) {
+      menuSelection = recentSelection = null;
+      menuOpen = false;
+    }
+    clearEventBody(event); schedule();
+  });
   listen('focusin', schedule);
   listen('focusout', schedule);
   listen('compositionstart', event => { composing = eventBody(event); clearEventBody(event); schedule(); });
   listen('compositionend', () => { composing = null; schedule(); });
   listen('beforeinput', clearEventBody);
   listen('input', schedule);
-  listen('selectionchange', schedule);
+  listen('selectionchange', () => {
+    if (!menuOpen) {
+      const current = readMenuSelection();
+      if (current) recentSelection = current;
+    }
+    schedule();
+  });
   listen('scroll', schedule, { passive: true });
   listen('visibilitychange', () => { pressing = null; clear(); schedule(); });
   listen('transitionrun', schedule);
@@ -382,6 +499,7 @@
     cancelAnimationFrame(frame);
     observer.disconnect(); intersection.disconnect(); resize.disconnect();
     chrome.runtime.onMessage.removeListener(onMenuMessage);
+    clearTimeout(noticeTimer); notice?.remove();
     events.abort(); host.remove();
   }
   // On extension reload, context invalidation should leave the original visible.

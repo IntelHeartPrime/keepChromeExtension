@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Keep 标记删除线",
-  "version": "0.3.0",
+  "version": "0.3.4",
   "description": "右键添加或删除删除线、高亮，阅读时显示效果并保留原始标记。",
   "minimum_chrome_version": "105",
   "permissions": [
